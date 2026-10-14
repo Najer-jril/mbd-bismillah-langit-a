@@ -2,6 +2,9 @@ USE mbd_uts;
 
 DROP PROCEDURE IF EXISTS sp_login;
 DROP PROCEDURE IF EXISTS sp_logout;
+DROP PROCEDURE IF EXISTS sp_token_buat;
+DROP PROCEDURE IF EXISTS sp_token_pasang;
+DROP PROCEDURE IF EXISTS sp_token_lepas;
 DROP PROCEDURE IF EXISTS sp_membuat_akun;
 DROP PROCEDURE IF EXISTS sp_ubah_status_akun;
 DROP PROCEDURE IF EXISTS sp_menambah_penulis;
@@ -13,11 +16,7 @@ DROP PROCEDURE IF EXISTS sp_mengedit_status_peminjaman;
 DROP PROCEDURE IF EXISTS sp_pengembalian_buku;
 DROP PROCEDURE IF EXISTS sp_membayar_denda;
 
-
--- AUTENTIKASI
-
--- sp_login untuk login: cek email & password (hash) di database, lalu simpan sesi
--- koneksi ini ke user_sessions. Akun suspended boleh login, inactive tidak
+-- sp_login untuk login, cek email & password, simpan session (suspended boleh login, inactive gaboleh login)
 CREATE PROCEDURE sp_login(
     IN p_email    VARCHAR(100),
     IN p_password VARCHAR(255)
@@ -36,15 +35,10 @@ BEGIN
     END;
 
     START TRANSACTION;
-        -- bersihkan sesi milik koneksi yang sudah terputus tanpa logout
-        DELETE FROM user_sessions
-         WHERE connection_id NOT IN (SELECT processlist_id FROM performance_schema.threads
-                                      WHERE processlist_id IS NOT NULL);
-
         SELECT id, password, status INTO v_id, v_hash, v_status
           FROM users WHERE email = LOWER(TRIM(p_email));
 
-        -- pesan sengaja disamakan agar tidak membocorkan email mana yang terdaftar
+        -- message inactive kek salah email/pw
         IF v_id IS NULL OR fn_verifikasi_password(p_password, v_hash) = 0 OR v_status = 'inactive' THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Email atau password salah';
         END IF;
@@ -57,7 +51,7 @@ BEGIN
       FROM users WHERE id = v_id;
 END;
 
--- sp_logout untuk logout: hapus sesi milik koneksi ini
+-- sp_logout untuk logout dengan hapus session
 CREATE PROCEDURE sp_logout()
 BEGIN
     DECLARE v_msg TEXT;
@@ -78,15 +72,85 @@ BEGIN
     SELECT 'Logout berhasil' AS message;
 END;
 
--- == AKUN ==
+-- sp_token_buat : (HTTP) dipanggil tepat setelah sp_login di koneksi yang sama.
+--   Simpan hash token (TTL 24 jam) + bersihkan token kedaluwarsa milik user ini.
+CREATE PROCEDURE sp_token_buat(IN p_token_hash CHAR(64))
+BEGIN
+    DECLARE v_uid INT;
+    DECLARE v_exp DATETIME;
+    DECLARE v_msg TEXT;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 v_msg = MESSAGE_TEXT;
+        ROLLBACK;
+        SET v_msg = LEFT(CONCAT('[sp_token_buat] ', v_msg), 128);
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg, MYSQL_ERRNO = 5013;
+    END;
+ 
+    START TRANSACTION;
+        SET v_uid = fn_current_user_id();
+        IF v_uid IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Belum login';
+        END IF;
+        IF p_token_hash IS NULL OR p_token_hash NOT REGEXP '^[0-9a-f]{64}$' THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Format token tidak valid';
+        END IF;
+ 
+        SET v_exp = NOW() + INTERVAL 24 HOUR;
+        DELETE FROM auth_tokens WHERE user_id = v_uid AND expires_at <= NOW();   -- bersih-bersih malas
+        INSERT INTO auth_tokens (token_hash, user_id, expires_at)
+        VALUES (p_token_hash, v_uid, v_exp);
+    COMMIT;
+ 
+    SELECT v_exp AS expires_at;
+END;
+ 
+-- sp_token_pasang : (HTTP) awal setiap request terautentikasi.
+--   Token valid + belum kedaluwarsa + akun tidak inactive -> pasang konteks pelaku.
+CREATE PROCEDURE sp_token_pasang(IN p_token_hash CHAR(64))
+BEGIN
+    DECLARE v_uid INT DEFAULT NULL;
+    DECLARE v_msg TEXT;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 v_msg = MESSAGE_TEXT;
+        ROLLBACK;
+        DELETE FROM user_sessions WHERE connection_id = CONNECTION_ID();
+        SET v_msg = LEFT(CONCAT('[sp_token_pasang] ', v_msg), 128);
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg, MYSQL_ERRNO = 5014;
+    END;
+ 
+    DELETE FROM user_sessions WHERE connection_id = CONNECTION_ID();   -- buang sisa konteks koneksi bekas
+ 
+    START TRANSACTION;
+        SELECT t.user_id INTO v_uid
+          FROM auth_tokens t
+          JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = p_token_hash
+           AND t.expires_at > NOW()
+           AND u.status <> 'inactive';
+        IF v_uid IS NULL THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Sesi tidak valid atau kedaluwarsa';
+        END IF;
+ 
+        UPDATE auth_tokens SET last_used_at = NOW() WHERE token_hash = p_token_hash;
+        REPLACE INTO user_sessions (connection_id, user_id, login_at)
+        VALUES (CONNECTION_ID(), v_uid, NOW());
+    COMMIT;
+END;
+ 
+-- sp_token_lepas : (HTTP) awal & akhir SETIAP request. Lepas konteks, tidak pernah error.
+CREATE PROCEDURE sp_token_lepas()
+BEGIN
+    DELETE FROM user_sessions WHERE connection_id = CONNECTION_ID();
+END;
 
--- sp_membuat_akun untuk admin membuat akun baru <<include>> menetapkan akses (role staff/member).
--- Password di-hash dengan salt acak sebelum disimpan
+-- sp_membuat_akun, admin membuat akun baru + useace include menetapkan role staff atau member
 CREATE PROCEDURE sp_membuat_akun(
     IN  p_name     VARCHAR(100),
     IN  p_email    VARCHAR(100),
-    IN  p_password VARCHAR(255),       -- plain text, di-hash di sini
-    IN  p_role     VARCHAR(10),        -- 'staff' | 'member'
+    IN  p_password VARCHAR(255),
+    IN  p_role     VARCHAR(10),
     OUT p_user_id  INT
 )
 BEGIN
@@ -127,23 +191,21 @@ BEGIN
         SET v_salt = LOWER(HEX(RANDOM_BYTES(16)));
         INSERT INTO users (name, email, password, role, status)
         VALUES (TRIM(p_name), p_email, fn_hash_password(p_password, v_salt), p_role, 'active');
-        SET p_user_id = LAST_INSERT_ID();               -- email duplikat -> error 1062 -> handler
+        SET p_user_id = LAST_INSERT_ID(); -- email duplikat -> error
     COMMIT;
 END;
 
--- sp_ubah_status_akun untuk admin mengubah status akun (active / suspended / inactive).
--- Member di-suspend/nonaktif -> pengajuan pending otomatis ditolak (stok kembali);
--- status inactive -> sesinya dihapus (dipaksa logout)
+-- sp_ubah_status_akun : admin ubah status akun; kalo user ada pengajuan pinjaman pas diupdate status jadi suspend/nonaktif yang masih pending jadi rejected,kalo user diubah jadi inactive langsung logout
 CREATE PROCEDURE sp_ubah_status_akun(
-    IN  p_user_id         INT,          -- akun TARGET (bukan pelaku)
-    IN  p_status          VARCHAR(10),  -- 'active' | 'suspended' | 'inactive'
+    IN  p_user_id INT, -- akun target yang mo diganti statusnya
+    IN  p_status VARCHAR(10),
     OUT p_pending_ditolak INT
 )
 BEGIN
-    DECLARE v_admin      INT;
-    DECLARE v_role       VARCHAR(10) DEFAULT NULL;
+    DECLARE v_admin INT;
+    DECLARE v_role VARCHAR(10) DEFAULT NULL;
     DECLARE v_old_status VARCHAR(10);
-    DECLARE v_msg        TEXT;
+    DECLARE v_msg TEXT;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         GET DIAGNOSTICS CONDITION 1 v_msg = MESSAGE_TEXT;
@@ -199,9 +261,7 @@ BEGIN
     COMMIT;
 END;
 
--- = PENULIS & BUKU 
-
--- sp_menambah_penulis untuk staff/admin menambah penulis baru
+-- sp_menambah_penulis, staff n admin bisa nambah penulis
 CREATE PROCEDURE sp_menambah_penulis(
     IN  p_name      VARCHAR(150),
     OUT p_author_id INT
@@ -229,20 +289,19 @@ BEGIN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Nama penulis wajib diisi';
         END IF;
 
-        INSERT INTO authors (name) VALUES (TRIM(p_name));         -- nama duplikat -> 1062
+        INSERT INTO authors (name) VALUES (TRIM(p_name)); -- nama dupe ke error 1062
         SET p_author_id = LAST_INSERT_ID();
     COMMIT;
 END;
 
--- sp_menambah_buku untuk staff/admin menambah buku + menautkan penulisnya (JSON array id penulis,
--- mis. '[3,7]'). Stok tersedia & kolom author diisi otomatis oleh trigger
+-- sp_menambah_buku, staff n admin bisa nambah buku dan penulisnya jadi format json array karena bisa lebih dari 1 orang contoh '[3,7]' dan genre juga bisa lebih dari 1
 CREATE PROCEDURE sp_menambah_buku(
-    IN  p_title       VARCHAR(200),
-    IN  p_isbn        VARCHAR(20),
+    IN  p_title VARCHAR(200),
+    IN  p_isbn VARCHAR(20),
     IN  p_total_stock INT,
-    IN  p_genre       JSON,
-    IN  p_author_ids  JSON,
-    OUT p_book_id     INT
+    IN  p_genre JSON,
+    IN  p_author_ids JSON,
+    OUT p_book_id INT
 )
 BEGIN
     DECLARE v_msg TEXT;
@@ -279,25 +338,24 @@ BEGIN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Daftar penulis kosong / tidak ditemukan / duplikat';
         END IF;
 
-        INSERT INTO books (title, isbn, total_stock, genre)              -- trg_books_before_insert_stock
-        VALUES (TRIM(p_title), p_isbn, p_total_stock, p_genre);          -- ISBN duplikat -> 1062
+        INSERT INTO books (title, isbn, total_stock, genre) -- trg_books_before_insert_stock
+        VALUES (TRIM(p_title), p_isbn, p_total_stock, p_genre);-- ISBN dupe eror 1062
         SET p_book_id = LAST_INSERT_ID();
 
-        INSERT INTO book_authors (book_id, author_id, author_order)      -- trg_book_authors_after_insert_sync
+        INSERT INTO book_authors (book_id, author_id, author_order) -- trg_book_authors_after_insert_sync
         SELECT p_book_id, jt.aid, jt.urut
           FROM JSON_TABLE(p_author_ids, '$[*]' COLUMNS (urut FOR ORDINALITY, aid INT PATH '$')) jt;
     COMMIT;
 END;
 
--- sp_mengedit_detail_buku untuk staff/admin mengedit detail buku; parameter NULL = tidak diubah.
--- Ganti total stok -> stok tersedia ikut bergeser (trigger)
+-- sp_mengedit_detail_buku, staff n admin bisa edit detail buku (NULL = tidak diubah)
 CREATE PROCEDURE sp_mengedit_detail_buku(
-    IN p_book_id     INT,
-    IN p_title       VARCHAR(200),
-    IN p_isbn        VARCHAR(20),
+    IN p_book_id INT,
+    IN p_title VARCHAR(200),
+    IN p_isbn VARCHAR(20),
     IN p_total_stock INT,
-    IN p_genre       JSON,
-    IN p_author_ids  JSON
+    IN p_genre JSON,
+    IN p_author_ids JSON
 )
 BEGIN
     DECLARE v_found   INT DEFAULT NULL;
@@ -340,10 +398,10 @@ BEGIN
         END IF;
 
         UPDATE books
-           SET title       = COALESCE(TRIM(p_title), title),
-               isbn        = COALESCE(p_isbn, isbn),
+           SET title = COALESCE(TRIM(p_title), title),
+               isbn = COALESCE(p_isbn, isbn),
                total_stock = COALESCE(p_total_stock, total_stock),
-               genre       = COALESCE(p_genre, genre)
+               genre = COALESCE(p_genre, genre)
          WHERE id = p_book_id;
 
         IF p_author_ids IS NOT NULL THEN
@@ -355,8 +413,7 @@ BEGIN
     COMMIT;
 END;
 
--- sp_menghapus_buku untuk staff/admin menghapus buku secara SOFT DELETE (isi deleted_at).
--- Ditolak kalau buku masih dipinjam / diajukan
+-- sp_menghapus_buku, staff n admin bisa soft delete buku, gabisa delete buku kalomasih dipinjam/diajukan
 CREATE PROCEDURE sp_menghapus_buku(IN p_book_id INT)
 BEGIN
     DECLARE v_found   INT DEFAULT NULL;
@@ -393,19 +450,18 @@ BEGIN
     COMMIT;
 END;
 
---  PEMINJAMAN ==
-
--- sp_meminjam_buku untuk member mengajukan pinjaman: cek gate fn_pinjaman_valid (stok, kuota,
--- denda, keterlambatan), buat pinjaman 'pending', lalu reserve stok (-1)
+-- sp_meminjam_buku, member bisa mengajukan pinjaman: cek gate, buat pending, reserve stok -1
 CREATE PROCEDURE sp_meminjam_buku(
     IN  p_book_id INT,
     OUT p_loan_id INT
 )
 BEGIN
-    DECLARE v_uid    INT;
-    DECLARE v_lock   INT;
+    DECLARE v_uid INT;
+    DECLARE v_lock INT;
+    DECLARE v_active INT DEFAULT 0;
+    DECLARE v_avail  INT DEFAULT 0;
     DECLARE v_alasan VARCHAR(100);
-    DECLARE v_msg    TEXT;
+    DECLARE v_msg TEXT;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         GET DIAGNOSTICS CONDITION 1 v_msg = MESSAGE_TEXT;
@@ -422,14 +478,33 @@ BEGIN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Belum login';
         END IF;
 
-        -- Lock 1: baris member -> 2 pengajuan paralel dari member yang sama tidak bisa lolos kuota bersamaan
+        -- kunci data member buat cegah 2 pengajuan bersamaan melewati kuota
         SELECT id INTO v_lock FROM users WHERE id = v_uid FOR UPDATE;
-        -- Lock 2: baris buku   -> 2 member tidak bisa mengambil eksemplar terakhir bersamaan
+        -- kunci data buku buat cegah 2 member mengambil unit terakhir bersamaan
         SELECT id INTO v_lock FROM books WHERE id = p_book_id FOR UPDATE;
 
         SET v_alasan = fn_pinjaman_valid(p_book_id);
         IF v_alasan <> 'OK' THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_alasan;
+        END IF;
+
+        -- Re-cek kuota dengan locking read: fn_jumlah_pinjaman_aktif (dipakai fn_pinjaman_valid)
+        -- baca non-locking, jadi lock user row di atas tidak melindungi hitungan baris baru
+        -- di tabel loans dari transaksi lain. FOR SHARE memaksa baca data terkomit terbaru.
+        SELECT COUNT(*) INTO v_active
+          FROM loans
+         WHERE user_id = v_uid AND status IN ('pending','borrowed')
+         FOR SHARE;
+        IF v_active >= fn_ambil_setting('MAX_PINJAM_AKTIF') THEN
+            SET v_msg = CONCAT('Kuota pinjam habis (maks ', fn_ambil_setting('MAX_PINJAM_AKTIF'), ' aktif)');
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg;
+        END IF;
+
+        -- Re-cek stok dengan locking read: fn_buku_tersedia (dipakai fn_pinjaman_valid) baca
+        -- non-locking, jadi 2 member bisa lolos sekaligus mengambil unit terakhir yang sama.
+        SELECT available_stock INTO v_avail FROM books WHERE id = p_book_id FOR UPDATE;
+        IF v_avail <= 0 THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Stok buku habis';
         END IF;
 
         INSERT INTO loans (user_id, book_id, processed_by, loan_date, due_date, status)
@@ -441,11 +516,10 @@ BEGIN
     COMMIT;
 END;
 
--- sp_mengedit_status_peminjaman untuk staff/admin ACC ('approve') atau menolak ('reject') pengajuan.
--- processed_by otomatis = staff yang login. Ditolak -> stok kembali (trigger)
+-- sp_mengedit_status_peminjaman, staff n admin approve / reject pengajuan
 CREATE PROCEDURE sp_mengedit_status_peminjaman(
     IN p_loan_id INT,
-    IN p_action  VARCHAR(10)          -- 'approve' | 'reject'
+    IN p_action  VARCHAR(10)
 )
 BEGIN
     DECLARE v_staff     INT;
@@ -488,10 +562,10 @@ BEGIN
             END IF;
 
             UPDATE loans
-               SET status       = 'borrowed',
+               SET status = 'borrowed',
                    processed_by = v_staff,
-                   loan_date    = CURDATE(),
-                   due_date     = CURDATE() + INTERVAL fn_ambil_setting('LAMA_PINJAM_HARI') DAY
+                   loan_date = CURDATE(),
+                   due_date = CURDATE() + INTERVAL fn_ambil_setting('LAMA_PINJAM_HARI') DAY
              WHERE id = p_loan_id;
         ELSE
             UPDATE loans
@@ -501,17 +575,16 @@ BEGIN
     COMMIT;
 END;
 
--- sp_pengembalian_buku untuk staff/admin menerima pengembalian buku: status jadi 'returned',
--- stok +1 & denda (jika telat) dicatat trigger. p_bayar_denda = 1 -> langsung lunas
+-- sp_pengembalian_buku, staff/admin terima pengembalian buku, update stok & denda via trigger, kalo p_bayar_denda=1 langsung lunas
 CREATE PROCEDURE sp_pengembalian_buku(
-    IN  p_loan_id     INT,
+    IN  p_loan_id INT,
     IN  p_bayar_denda TINYINT,
-    OUT p_denda       DECIMAL(10,2)
+    OUT p_denda DECIMAL(10,2)
 )
 BEGIN
     DECLARE v_status VARCHAR(10) DEFAULT NULL;
-    DECLARE v_due    DATE;
-    DECLARE v_msg    TEXT;
+    DECLARE v_due DATE;
+    DECLARE v_msg TEXT;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
     BEGIN
         GET DIAGNOSTICS CONDITION 1 v_msg = MESSAGE_TEXT;
@@ -539,7 +612,7 @@ BEGIN
         END IF;
 
         UPDATE loans SET status = 'returned', return_date = CURDATE()
-         WHERE id = p_loan_id;                      -- trigger: stok +1, INSERT fines jika telat
+         WHERE id = p_loan_id; -- trigger stok +1, INSERT fines jika telat
 
         SET p_denda = fn_hitung_denda(v_due, CURDATE());
         IF p_denda > 0 AND COALESCE(p_bayar_denda, 0) = 1 THEN
@@ -548,7 +621,7 @@ BEGIN
     COMMIT;
 END;
 
--- sp_membayar_denda untuk staff/admin melunasi denda di loket
+-- sp_membayar_denda, staff/admin melunasi denda
 CREATE PROCEDURE sp_membayar_denda(IN p_fine_id INT)
 BEGIN
     DECLARE v_pay VARCHAR(10) DEFAULT NULL;

@@ -1,16 +1,8 @@
--- =====================================================================
--- TRIGGER versi PLAIN untuk DBeaver (tanpa DELIMITER, tanpa //)
--- CARA PAKAI (Mac):
---   1. Blok USE + semua DROP TRIGGER -> Option + X
---   2. Blok 1 trigger (CREATE TRIGGER s/d END;) -> Cmd + Enter
---   3. Kerjakan berurutan dari atas. Wajib: function sudah dibuat dulu,
---      dan trg_loans_after_update_stock harus ada sebelum
---      trg_loans_after_update_fine (dipakai di FOLLOWS).
--- =====================================================================
 USE mbd_uts;
 
 DROP TRIGGER IF EXISTS trg_users_before_insert_guard;
 DROP TRIGGER IF EXISTS trg_users_before_update_guard;
+DROP TRIGGER IF EXISTS trg_users_after_update_revoke;
 DROP TRIGGER IF EXISTS trg_users_before_delete_block;
 DROP TRIGGER IF EXISTS trg_authors_after_update_sync;
 DROP TRIGGER IF EXISTS trg_book_authors_after_insert_sync;
@@ -20,17 +12,15 @@ DROP TRIGGER IF EXISTS trg_books_before_update_stock;
 DROP TRIGGER IF EXISTS trg_books_before_delete_block;
 DROP TRIGGER IF EXISTS trg_loans_before_insert_guard;
 DROP TRIGGER IF EXISTS trg_loans_before_update_status;
-DROP TRIGGER IF EXISTS trg_loans_after_update_fine;      -- di-drop sebelum _stock karena FOLLOWS
+DROP TRIGGER IF EXISTS trg_loans_after_update_fine;
 DROP TRIGGER IF EXISTS trg_loans_after_update_stock;
 DROP TRIGGER IF EXISTS trg_loans_before_delete_block;
 DROP TRIGGER IF EXISTS trg_fines_before_insert_guard;
 DROP TRIGGER IF EXISTS trg_fines_before_update_lock;
 DROP TRIGGER IF EXISTS trg_fines_before_delete_block;
 
--- ------------------------------------------------------------- USERS
 
--- trg_users_before_insert_guard untuk merapikan email (huruf kecil, tanpa spasi),
--- menolak password yang belum di-hash, dan memastikan status suspended hanya untuk member
+-- trg_users_before_insert_guard untuk merapikan email (all lower), menolak password belum di-hash, status suspended hanya untuk member
 CREATE TRIGGER trg_users_before_insert_guard
 BEFORE INSERT ON users
 FOR EACH ROW
@@ -44,8 +34,7 @@ BEGIN
     END IF;
 END;
 
--- trg_users_before_update_guard untuk mengunci role (tidak bisa diubah setelah dibuat),
--- menolak password baru yang belum di-hash, dan mencegah admin aktif terakhir dinonaktifkan
+-- trg_users_before_update_guard untuk mengunci role, menolak password belum di-hash, gaboleh inactive last admin aktif 
 CREATE TRIGGER trg_users_before_update_guard
 BEFORE UPDATE ON users
 FOR EACH ROW
@@ -68,7 +57,17 @@ BEGIN
     END IF;
 END;
 
--- trg_users_before_delete_block untuk melarang hapus user permanen (pakai status inactive)
+-- trg_users_after_update_revoke untuk semua akun yang diubah status jadi inactive, semua token login HTTP dicabut / paksa logout
+CREATE TRIGGER trg_users_after_update_revoke
+AFTER UPDATE ON users
+FOR EACH ROW
+BEGIN
+    IF NEW.status = 'inactive' AND OLD.status <> 'inactive' THEN
+        DELETE FROM auth_tokens WHERE user_id = NEW.id;
+    END IF;
+END;
+
+-- trg_users_before_delete_block, melarang hard delete/hapus permanen akun user (pakai status inactive)
 CREATE TRIGGER trg_users_before_delete_block
 BEFORE DELETE ON users
 FOR EACH ROW
@@ -76,10 +75,7 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'User tidak boleh dihapus, gunakan status inactive';
 END;
 
--- ------------------------------------------------------------- AUTHORS / BOOK_AUTHORS
-
--- trg_authors_after_update_sync untuk memperbarui books.author di semua buku karya penulis
--- itu ketika nama penulis diubah
+-- trg_authors_after_update_sync, nama penulis diubah terus diperbarui books.author di semua bukunya
 CREATE TRIGGER trg_authors_after_update_sync
 AFTER UPDATE ON authors
 FOR EACH ROW
@@ -93,8 +89,7 @@ BEGIN
     END IF;
 END;
 
--- trg_book_authors_after_insert_sync untuk mengisi ulang books.author (gabungan nama penulis)
--- setiap kali penulis ditautkan ke buku
+-- trg_book_authors_after_insert_sync, penulis ditautkan ke buku terus update books.author juga
 CREATE TRIGGER trg_book_authors_after_insert_sync
 AFTER INSERT ON book_authors
 FOR EACH ROW
@@ -106,8 +101,7 @@ BEGIN
      WHERE id = NEW.book_id;
 END;
 
--- trg_book_authors_after_delete_sync untuk mengisi ulang books.author setiap kali
--- penulis dilepas dari buku (kosong '' kalau sudah tidak ada penulis)
+-- trg_book_authors_after_delete_sync, penulis dilepas dari buku terus update books.author juga
 CREATE TRIGGER trg_book_authors_after_delete_sync
 AFTER DELETE ON book_authors
 FOR EACH ROW
@@ -119,10 +113,7 @@ BEGIN
      WHERE id = OLD.book_id;
 END;
 
--- ------------------------------------------------------------- BOOKS
-
--- trg_books_before_insert_stock untuk buku baru: available_stock otomatis = total_stock
--- (nilai dari input diabaikan) dan buku baru tidak boleh langsung berstatus terhapus
+-- trg_books_before_insert_stock, ketika insert buku baru total stok langsung jadi available_stock, gabisa negatif, dan 
 CREATE TRIGGER trg_books_before_insert_stock
 BEFORE INSERT ON books
 FOR EACH ROW
@@ -134,9 +125,7 @@ BEGIN
     SET NEW.deleted_at = NULL;
 END;
 
--- trg_books_before_update_stock untuk menggeser available_stock ketika total_stock diubah
--- (mis. total 3 -> 5, available ikut +2), menolak total lebih kecil dari eksemplar yang
--- sedang dipinjam, dan membekukan buku yang sudah di-soft delete
+-- trg_books_before_update_stock, total_stock berubah jadinya available_stock ikut berubah, kalo ada buku terhapus mau di edeit sudah gabisa karna dibekukan
 CREATE TRIGGER trg_books_before_update_stock
 BEFORE UPDATE ON books
 FOR EACH ROW
@@ -152,13 +141,12 @@ BEGIN
         SET NEW.available_stock = OLD.available_stock + (NEW.total_stock - OLD.total_stock);
         IF NEW.available_stock < 0 THEN
             SIGNAL SQLSTATE '45000'
-                SET MESSAGE_TEXT = 'Stok total tidak boleh kurang dari eksemplar yang sedang dipinjam/diajukan';
+                SET MESSAGE_TEXT = 'Stok total tidak boleh kurang dari unit yang sedang dipinjam/diajukan';
         END IF;
     END IF;
 END;
 
--- trg_books_before_delete_block untuk melarang hapus buku permanen (wajib soft delete
--- lewat sp_menghapus_buku)
+-- trg_books_before_delete_block, larang hapus buku permanen (bisa soft delete lewat sp menghapus_buku)
 CREATE TRIGGER trg_books_before_delete_block
 BEFORE DELETE ON books
 FOR EACH ROW
@@ -166,10 +154,7 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Buku tidak boleh dihapus permanen, gunakan sp_menghapus_buku';
 END;
 
--- ------------------------------------------------------------- LOANS
-
--- trg_loans_before_insert_guard untuk memastikan pinjaman baru selalu lahir sebagai
--- pengajuan 'pending' (belum diproses, belum kembali) dan peminjamnya harus member
+-- trg_loans_before_insert_guard, pinjaman baru wajib pending dan peminjamnya harus member
 CREATE TRIGGER trg_loans_before_insert_guard
 BEFORE INSERT ON loans
 FOR EACH ROW
@@ -183,9 +168,7 @@ BEGIN
     END IF;
 END;
 
--- trg_loans_before_update_status untuk menjaga alur status pinjaman
--- (pending -> borrowed/rejected, borrowed -> returned), ACC/tolak wajib ada staff-nya
--- di processed_by, dan return_date otomatis diisi hari ini saat dikembalikan
+-- trg_loans_before_update_status, protek flow status peminjaman, harus dari pending ke borrowed/rejected dan borrowed ke returned, ACC wajib ada akun staff
 CREATE TRIGGER trg_loans_before_update_status
 BEFORE UPDATE ON loans
 FOR EACH ROW
@@ -217,8 +200,7 @@ BEGIN
     END IF;
 END;
 
--- trg_loans_after_update_stock untuk <<include>> update stok buku: stok +1 ketika
--- pengajuan ditolak (reservasi batal) atau buku dikembalikan
+-- trg_loans_after_update_stock, usecase <<include>> untuk update stok, stok +1 saat ditolak / dikembalikan
 CREATE TRIGGER trg_loans_after_update_stock
 AFTER UPDATE ON loans
 FOR EACH ROW
@@ -229,9 +211,7 @@ BEGIN
     END IF;
 END;
 
--- trg_loans_after_update_fine untuk <<extend>> menghitung denda: kalau buku kembali
--- lewat jatuh tempo, otomatis catat denda 'unpaid'. FOLLOWS = dijalankan SETELAH
--- trg_loans_after_update_stock (urutan pasti karena event & timing-nya sama)
+-- trg_loans_after_update_fine, usecase <<extend>> buat hitung denda, mencatat denda jika telat mengembalikan
 CREATE TRIGGER trg_loans_after_update_fine
 AFTER UPDATE ON loans
 FOR EACH ROW
@@ -246,7 +226,7 @@ BEGIN
     END IF;
 END;
 
--- trg_loans_before_delete_block untuk melarang hapus riwayat peminjaman
+-- trg_loans_before_delete_block, gaboleh hapus riwayat peminjaman
 CREATE TRIGGER trg_loans_before_delete_block
 BEFORE DELETE ON loans
 FOR EACH ROW
@@ -254,10 +234,7 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Data peminjaman tidak boleh dihapus';
 END;
 
--- ------------------------------------------------------------- FINES
-
--- trg_fines_before_insert_guard untuk memastikan denda hanya dibuat untuk pinjaman yang
--- sudah dikembalikan, dan denda baru selalu berstatus 'unpaid'
+-- trg_fines_before_insert_guard, denda hanya untuk pinjaman status returned, dan statusnya langsung unpaid
 CREATE TRIGGER trg_fines_before_insert_guard
 BEFORE INSERT ON fines
 FOR EACH ROW
@@ -268,8 +245,7 @@ BEGIN
     SET NEW.payment_status = 'unpaid';
 END;
 
--- trg_fines_before_update_lock untuk mengunci denda: yang sudah lunas tidak bisa diubah,
--- dan nominal / pinjaman pada denda tidak boleh diubah manual
+-- trg_fines_before_update_lock, total akhir denda lunas, nominal tidak boleh diubah
 CREATE TRIGGER trg_fines_before_update_lock
 BEFORE UPDATE ON fines
 FOR EACH ROW
@@ -282,7 +258,7 @@ BEGIN
     END IF;
 END;
 
--- trg_fines_before_delete_block untuk melarang hapus denda (sama dengan memutihkan utang)
+-- trg_fines_before_delete_block, ga boleh hapus denda
 CREATE TRIGGER trg_fines_before_delete_block
 BEFORE DELETE ON fines
 FOR EACH ROW

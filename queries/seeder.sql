@@ -1,16 +1,16 @@
--- * Password SEMUA akun: Perpus#2026  (format salt$sha256, salt tetap per user)
+-- pw all akun Perpus#2026
 
--- PERSONA MEMBER (dipakai di 04_test.sql)
---   nazril  : bersih                    -> pinjam sukses
---   adit    : kuota penuh (3 aktif)     -> gate kuota; pegang eksemplar terakhir "Clean Code"
---   iqbal   : denda 4000 belum dibayar  -> gate denda
---   faisal  : buku terlambat 5 hari     -> gate keterlambatan
---   mahar   : suspended                 -> boleh login, tidak boleh pinjam
---   radit   : inactive                  -> tidak boleh login
---   rahmi   : pengajuan pending         -> staff ACC
---   shadiq  : pengajuan pending         -> staff tolak
---   irfan   : pinjam terlambat 3 hari   -> staff terima kembali + denda
---   rizky   : pinjam belum jatuh tempo  -> staff terima kembali tanpa denda
+-- PERSONA MEMBER
+--   nazril : bersih                    -> pinjam sukses
+--   adit : kuota penuh (3 aktif)     -> gate kuota; pegang eksemplar terakhir "Clean Code"
+--   iqbal : denda 4000 belum dibayar  -> gate denda
+--   faisal : buku terlambat 5 hari     -> gate keterlambatan
+--   mahar : suspended                 -> boleh login, tidak boleh pinjam
+--   radit : inactive                  -> tidak boleh login
+--   rahmi : pengajuan pending         -> staff ACC
+--   shadiq : pengajuan pending         -> staff tolak
+--   irfan : pinjam terlambat 3 hari   -> staff terima kembali + denda
+--   rizky : pinjam belum jatuh tempo  -> staff terima kembali tanpa denda
 --   miftah, abim : riwayat panjang
 -- STAFF: galih (2), zaki (3), hilma (4, inactive)   ADMIN: dimas (1)
 

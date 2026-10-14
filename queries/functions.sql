@@ -5,6 +5,7 @@ DROP FUNCTION IF EXISTS fn_hash_password;
 DROP FUNCTION IF EXISTS fn_verifikasi_password;
 DROP FUNCTION IF EXISTS fn_current_user_id;
 DROP FUNCTION IF EXISTS fn_cek_akses;
+DROP FUNCTION IF EXISTS fn_nama_user;
 DROP FUNCTION IF EXISTS fn_jumlah_pinjaman_aktif;
 DROP FUNCTION IF EXISTS fn_sisa_kuota_pinjam;
 DROP FUNCTION IF EXISTS fn_buku_tersedia;
@@ -14,6 +15,7 @@ DROP FUNCTION IF EXISTS fn_total_denda_belum_bayar;
 DROP FUNCTION IF EXISTS fn_jumlah_terlambat;
 DROP FUNCTION IF EXISTS fn_pinjaman_valid;
 DROP FUNCTION IF EXISTS fn_penulis_valid;
+
 
 -- fn_ambil_setting untuk settingan hardcode
 CREATE FUNCTION fn_ambil_setting(p_key VARCHAR(30))
@@ -76,6 +78,19 @@ BEGIN
        AND u.status = 'active'
        AND FIND_IN_SET(u.role, p_roles) > 0;
     RETURN v_oke;
+END;
+
+-- fn_nama_user untuk ambil nama user dari id user
+CREATE FUNCTION fn_nama_user(p_user_id INT)
+RETURNS VARCHAR(100)
+READS SQL DATA
+BEGIN
+    DECLARE v_name VARCHAR(100) DEFAULT NULL;
+    IF p_user_id IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT name INTO v_name FROM users WHERE id = p_user_id;
+    RETURN v_name;
 END;
 
 -- fn_jumlah_pinjaman_aktif untuk cek jumlah pinjaman ke member

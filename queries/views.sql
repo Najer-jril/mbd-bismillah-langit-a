@@ -1,9 +1,10 @@
 USE mbd_uts;
 
-DROP VIEW IF EXISTS vw_sesi_saya, vw_katalog_buku, vw_penulis_buku,
+DROP VIEW IF EXISTS vw_sesi_saya, vw_katalog_buku, vw_penulis_buku, vw_penulis, vw_genre,
                     vw_riwayat_saya, vw_denda_saya, vw_kuota_saya,
                     vw_akun_user, vw_status_buku, vw_detail_peminjaman, vw_detail_denda, vw_audit_stok;
 
+-- vw_penulis, genre,
 -- all role
 -- vw_sesi_saya untuk melihat siapa yang sedang login di koneksi ini
 CREATE VIEW vw_sesi_saya AS
@@ -35,8 +36,24 @@ JOIN authors a ON a.id = ba.author_id
 WHERE EXISTS (SELECT 1 FROM user_sessions s JOIN users su ON su.id = s.user_id
                WHERE s.connection_id = CONNECTION_ID() AND su.status <> 'inactive');
 
+-- vw_penulis, list semua penulis, wajib login
+CREATE VIEW vw_penulis AS
+SELECT a.id AS author_id, a.name
+FROM authors a
+WHERE EXISTS (SELECT 1 FROM user_sessions s JOIN users su ON su.id = s.user_id
+               WHERE s.connection_id = CONNECTION_ID() AND su.status <> 'inactive');
+ 
+-- vw_genre, list all genre unik dari buku yang belum dihapus, wajib login.
+CREATE VIEW vw_genre AS
+SELECT DISTINCT jt.genre
+FROM books b,
+     JSON_TABLE(b.genre, '$[*]' COLUMNS (genre VARCHAR(50) PATH '$')) jt
+WHERE b.deleted_at IS NULL
+  AND EXISTS (SELECT 1 FROM user_sessions s JOIN users su ON su.id = s.user_id
+               WHERE s.connection_id = CONNECTION_ID() AND su.status <> 'inactive');
+
 -- member only
--- vw_riwayat_saya untuk member melihat riwayat peminjaman miliknya user sendiri (+ status terlambat & estimasi denda)
+-- vw_riwayat_saya untuk member melihat riwayat peminjaman miliknya user sendiri ( dengan status terlambat dan estimasi denda)
 CREATE VIEW vw_riwayat_saya AS
 SELECT l.id AS loan_id,
        b.title,
@@ -68,29 +85,29 @@ FROM fines f
 JOIN loans l ON l.id = f.loan_id
 WHERE l.user_id = (SELECT s.user_id FROM user_sessions s WHERE s.connection_id = CONNECTION_ID());
 
--- vw_kuota_saya untuk member melihat limit pinjam: pinjaman aktif, sisa kuota, jumlah terlambat, total denda belum dibayar
+-- vw_kuota_saya untuk member melihat limit pinjam, ada pinjaman aktif, sisa kuota, jumlah terlambat, total denda belum dibayar
 CREATE VIEW vw_kuota_saya AS
 SELECT u.id AS user_id,
        u.name,
        u.status,
        fn_jumlah_pinjaman_aktif(u.id)   AS active_loans,
        fn_ambil_setting('MAX_PINJAM_AKTIF') AS max_loans,
-       fn_sisa_kuota_pinjam(u.id)       AS remaining_quota,
-       fn_jumlah_terlambat(u.id)        AS late_loans,
+       fn_sisa_kuota_pinjam(u.id) AS remaining_quota,
+       fn_jumlah_terlambat(u.id) AS late_loans,
        fn_total_denda_belum_bayar(u.id) AS unpaid_fines
 FROM users u
 WHERE u.role = 'member'
   AND u.id = (SELECT s.user_id FROM user_sessions s WHERE s.connection_id = CONNECTION_ID());
 
 -- staff n admin
--- vw_akun_user untuk staff/admin melihat semua akun (tanpa password)
+-- vw_akun_user untuk staff n admin melihat semua akun
 CREATE VIEW vw_akun_user AS
 SELECT u.id AS user_id,
        u.name,
        u.email,
        u.role,
        u.status,
-       IF(u.role = 'member', fn_jumlah_pinjaman_aktif(u.id),   NULL) AS active_loans,
+       IF(u.role = 'member', fn_jumlah_pinjaman_aktif(u.id), NULL) AS active_loans,
        IF(u.role = 'member', fn_total_denda_belum_bayar(u.id), NULL) AS unpaid_fines,
        u.created_at
 FROM users u
@@ -109,7 +126,7 @@ SELECT b.id AS book_id,
        b.total_stock - b.available_stock AS in_use,          -- dipinjam + di-reserve (pending)
        CASE
            WHEN b.deleted_at IS NOT NULL THEN 'dihapus'
-           WHEN b.available_stock = 0    THEN 'habis'
+           WHEN b.available_stock = 0 THEN 'habis'
            ELSE 'tersedia'
        END AS book_state,
        b.deleted_at
@@ -118,14 +135,15 @@ WHERE EXISTS (SELECT 1 FROM user_sessions s JOIN users su ON su.id = s.user_id
                WHERE s.connection_id = CONNECTION_ID()
                  AND su.status = 'active' AND su.role IN ('staff','admin'));
 
--- vw_detail_peminjaman untuk staff/admin melihat semua peminjaman: antrian ACC (status = 'pending'),
--- monitoring, dan yang terlambat
+-- vw_detail_peminjaman untuk staff n admin melihat semua peminjaman, isinya antrian perlu ACC (status = 'pending'), monitoring, dan yang terlambat
 CREATE VIEW vw_detail_peminjaman AS
 SELECT l.id AS loan_id,
        l.user_id,
+       m.name AS member_name,
        l.book_id,
        b.title,
        l.processed_by,
+       p.name AS processed_by_name,
        l.created_at AS requested_at,
        l.loan_date,
        l.due_date,
@@ -136,16 +154,20 @@ SELECT l.id AS loan_id,
        fn_hitung_denda (l.due_date, IF(l.status = 'borrowed', CURDATE(), l.return_date)) AS fine_estimate
 FROM loans l
 JOIN books b ON b.id = l.book_id
+JOIN users m ON m.id = l.user_id
+LEFT JOIN users p ON p.id = l.processed_by
 WHERE EXISTS (SELECT 1 FROM user_sessions s JOIN users su ON su.id = s.user_id
                WHERE s.connection_id = CONNECTION_ID()
                  AND su.status = 'active' AND su.role IN ('staff','admin'));
 
--- vw_detail_denda untuk staff/admin melihat semua denda (untuk pelunasan di loket)
+-- vw_detail_denda untuk staff n admin melihat semua denda
 CREATE VIEW vw_detail_denda AS
 SELECT f.id AS fine_id,
        f.loan_id,
        l.user_id,
+       m.name AS member_name,
        l.book_id,
+       b.title,
        l.due_date,
        l.return_date,
        fn_hari_terlambat(l.due_date, l.return_date) AS days_late,
@@ -155,18 +177,20 @@ SELECT f.id AS fine_id,
        f.updated_at AS last_update
 FROM fines f
 JOIN loans l ON l.id = f.loan_id
+JOIN books b ON b.id = l.book_id
+JOIN users m ON m.id = l.user_id
 WHERE EXISTS (SELECT 1 FROM user_sessions s JOIN users su ON su.id = s.user_id
                WHERE s.connection_id = CONNECTION_ID()
                  AND su.status = 'active' AND su.role IN ('staff','admin'));
 
--- vw_audit_stok untuk staff/admin mengecek konsistensi stok; normalnya 0 baris
+-- vw_audit_stok untuk staff n admin mengecek konsistensi stok; normalnya 0 baris
 CREATE VIEW vw_audit_stok AS
 SELECT b.id AS book_id,
        b.title,
        b.total_stock,
        b.available_stock,
        b.total_stock - b.available_stock AS in_use_by_stock,
-       COALESCE(x.active_loans, 0)       AS in_use_by_loans
+       COALESCE(x.active_loans, 0) AS in_use_by_loans
 FROM books b
 LEFT JOIN (SELECT book_id, COUNT(*) AS active_loans
              FROM loans
