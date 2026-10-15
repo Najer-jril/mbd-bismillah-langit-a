@@ -51,8 +51,8 @@ BEGIN
       FROM users WHERE id = v_id;
 END;
 
--- sp_logout untuk logout dengan hapus session
-CREATE PROCEDURE sp_logout()
+-- sp_logout untuk logout dengan hapus session + cabut token
+CREATE PROCEDURE sp_logout(IN p_token_hash CHAR(64))
 BEGIN
     DECLARE v_msg TEXT;
     DECLARE EXIT HANDLER FOR SQLEXCEPTION
@@ -68,6 +68,7 @@ BEGIN
         IF ROW_COUNT() = 0 THEN
             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Belum login';
         END IF;
+        DELETE FROM auth_tokens WHERE token_hash = p_token_hash;
     COMMIT;
     SELECT 'Logout berhasil' AS message;
 END;
