@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node --test --test-concurrency=1 tests/",
     "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "db:fresh": "node scripts/db-fresh.js"
   },
   "repository": {
     "type": "git",
