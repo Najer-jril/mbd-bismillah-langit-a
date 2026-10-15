@@ -31,11 +31,6 @@ export function paginate(query) {
     return { page, limit, offset: (page - 1) * limit };
 }
 
-/**
- * SELECT * FROM <view> [WHERE ...] ORDER BY <orderBy> LIMIT/OFFSET, plus total.
- * `view` dan `orderBy` HARUS literal dari kode (bukan input user). `where` = array string berisi '?'.
- * Return { rows, meta: { page, limit, total } }
- */
 export async function listView(conn, view, { where = [], params = [], orderBy, query }) {
     if (!/^[a-z_]+$/.test(view)) throw new Error("view tidak valid");
     const { page, limit, offset } = paginate(query);
