@@ -73,8 +73,7 @@ BEGIN
     SELECT 'Logout berhasil' AS message;
 END;
 
--- sp_token_buat : (HTTP) dipanggil tepat setelah sp_login di koneksi yang sama.
---   Simpan hash token (TTL 24 jam) + bersihkan token kedaluwarsa milik user ini.
+-- sp_token_buat buat token dan simpan hash token exp 24 jam + hapus token yang expire
 CREATE PROCEDURE sp_token_buat(IN p_token_hash CHAR(64))
 BEGIN
     DECLARE v_uid INT;
@@ -106,8 +105,7 @@ BEGIN
     SELECT v_exp AS expires_at;
 END;
  
--- sp_token_pasang : (HTTP) awal setiap request terautentikasi.
---   Token valid + belum kedaluwarsa + akun tidak inactive -> pasang konteks pelaku.
+-- sp_token_pasang, steiap awal rekues dan token valid + belum kedaluwarsa + akun tidak inactive boleh akses yang mau diakses
 CREATE PROCEDURE sp_token_pasang(IN p_token_hash CHAR(64))
 BEGIN
     DECLARE v_uid INT DEFAULT NULL;
@@ -121,7 +119,7 @@ BEGIN
         SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = v_msg, MYSQL_ERRNO = 5014;
     END;
  
-    DELETE FROM user_sessions WHERE connection_id = CONNECTION_ID();   -- buang sisa konteks koneksi bekas
+    DELETE FROM user_sessions WHERE connection_id = CONNECTION_ID();
  
     START TRANSACTION;
         SELECT t.user_id INTO v_uid
@@ -140,7 +138,7 @@ BEGIN
     COMMIT;
 END;
  
--- sp_token_lepas : (HTTP) awal & akhir SETIAP request. Lepas konteks, tidak pernah error.
+-- sp_token_lepas di awal request buat ke 1 tokken user aja, dan hapus kalo udah kelar requset
 CREATE PROCEDURE sp_token_lepas()
 BEGIN
     DELETE FROM user_sessions WHERE connection_id = CONNECTION_ID();
